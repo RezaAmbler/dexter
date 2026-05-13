@@ -1,11 +1,47 @@
+/**
+ * Finance API router.
+ *
+ * Tools call `api.get(endpoint, params, options)` using
+ * Financial Datasets–style endpoint strings (e.g. `/prices/`).
+ * This module routes those calls to whichever provider is active
+ * (FINANCE_PROVIDER env var) and layers caching on top.
+ *
+ * Caches are namespaced per-provider so switching providers does not
+ * serve stale entries shaped for a different upstream.
+ */
 import { readCache, writeCache, describeRequest } from '../../utils/cache.js';
 import { logger } from '../../utils/logger.js';
+import { financialDatasetsProvider } from './providers/financialdatasets.js';
+import { fmpProvider } from './providers/fmp.js';
+import type { ApiParams, ApiResponse, FinanceProvider } from './providers/types.js';
 
-const BASE_URL = 'https://api.financialdatasets.ai';
+export type { ApiResponse } from './providers/types.js';
 
-export interface ApiResponse {
-  data: Record<string, unknown>;
-  url: string;
+const PROVIDERS: Record<string, FinanceProvider> = {
+  financialdatasets: financialDatasetsProvider,
+  fmp: fmpProvider,
+};
+
+let warnedAboutUnknown = false;
+
+function getProvider(): FinanceProvider {
+  const requested = (process.env.FINANCE_PROVIDER || 'financialdatasets').toLowerCase();
+  const provider = PROVIDERS[requested];
+  if (provider) return provider;
+
+  if (!warnedAboutUnknown) {
+    logger.warn(
+      `[Finance API] unknown FINANCE_PROVIDER="${requested}" — falling back to financialdatasets. ` +
+      `Known providers: ${Object.keys(PROVIDERS).join(', ')}`,
+    );
+    warnedAboutUnknown = true;
+  }
+  return financialDatasetsProvider;
+}
+
+/** Build a provider-scoped cache key prefix so different upstreams don't share cache entries. */
+function cacheEndpoint(provider: FinanceProvider, endpoint: string): string {
+  return `${provider.name}:${endpoint}`;
 }
 
 /**
@@ -16,131 +52,60 @@ export function stripFieldsDeep(value: unknown, fields: readonly string[]): unkn
   const fieldsToStrip = new Set(fields);
 
   function walk(node: unknown): unknown {
-    if (Array.isArray(node)) {
-      return node.map(walk);
-    }
-
-    if (!node || typeof node !== 'object') {
-      return node;
-    }
-
+    if (Array.isArray(node)) return node.map(walk);
+    if (!node || typeof node !== 'object') return node;
     const record = node as Record<string, unknown>;
     const cleaned: Record<string, unknown> = {};
-
     for (const [key, child] of Object.entries(record)) {
-      if (fieldsToStrip.has(key)) {
-        continue;
-      }
+      if (fieldsToStrip.has(key)) continue;
       cleaned[key] = walk(child);
     }
-
     return cleaned;
   }
 
   return walk(value);
 }
 
-function getApiKey(): string {
-  return process.env.FINANCIAL_DATASETS_API_KEY || '';
-}
-
-/**
- * Shared request execution: handles API key, error handling, logging, and response parsing.
- */
-async function executeRequest(
-  url: string,
-  label: string,
-  init: RequestInit,
-): Promise<Record<string, unknown>> {
-  const apiKey = getApiKey();
-
-  if (!apiKey) {
-    logger.warn(`[Financial Datasets API] call without key: ${label}`);
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      ...init,
-      headers: {
-        'x-api-key': apiKey,
-        ...init.headers,
-      },
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error(`[Financial Datasets API] network error: ${label} — ${message}`);
-    throw new Error(`[Financial Datasets API] request failed for ${label}: ${message}`);
-  }
-
-  if (!response.ok) {
-    const detail = `${response.status} ${response.statusText}`;
-    logger.error(`[Financial Datasets API] error: ${label} — ${detail}`);
-    throw new Error(`[Financial Datasets API] request failed: ${detail}`);
-  }
-
-  const data = await response.json().catch(() => {
-    const detail = `invalid JSON (${response.status} ${response.statusText})`;
-    logger.error(`[Financial Datasets API] parse error: ${label} — ${detail}`);
-    throw new Error(`[Financial Datasets API] request failed: ${detail}`);
-  });
-
-  return data as Record<string, unknown>;
-}
-
 export const api = {
   async get(
     endpoint: string,
-    params: Record<string, string | number | string[] | undefined>,
+    params: ApiParams,
     options?: { cacheable?: boolean; ttlMs?: number },
   ): Promise<ApiResponse> {
+    const provider = getProvider();
     const label = describeRequest(endpoint, params);
+    const cacheKey = cacheEndpoint(provider, endpoint);
 
-    // Check local cache first — avoids redundant network calls for immutable data
     if (options?.cacheable) {
-      const cached = readCache(endpoint, params, options.ttlMs);
-      if (cached) {
-        return cached;
-      }
+      const cached = readCache(cacheKey, params, options.ttlMs);
+      if (cached) return cached;
     }
 
-    const url = new URL(`${BASE_URL}${endpoint}`);
-
-    // Add params to URL, handling arrays
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) {
-        if (Array.isArray(value)) {
-          value.forEach((v) => url.searchParams.append(key, v));
-        } else {
-          url.searchParams.append(key, String(value));
-        }
-      }
+    let response: ApiResponse;
+    try {
+      response = await provider.get(endpoint, params);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[${provider.name}] ${label} — ${message}`);
+      throw error;
     }
 
-    const data = await executeRequest(url.toString(), label, {});
-
-    // Persist for future requests when the caller marked the response as cacheable
     if (options?.cacheable) {
-      writeCache(endpoint, params, data, url.toString());
+      writeCache(cacheKey, params, response.data, response.url);
     }
 
-    return { data, url: url.toString() };
+    return response;
   },
 
-  async post(
-    endpoint: string,
-    body: Record<string, unknown>,
-  ): Promise<ApiResponse> {
-    const label = `POST ${endpoint}`;
-    const url = `${BASE_URL}${endpoint}`;
-
-    const data = await executeRequest(url, label, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
-    return { data, url };
+  async post(endpoint: string, body: Record<string, unknown>): Promise<ApiResponse> {
+    const provider = getProvider();
+    try {
+      return await provider.post(endpoint, body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error(`[${provider.name}] POST ${endpoint} — ${message}`);
+      throw error;
+    }
   },
 };
 
